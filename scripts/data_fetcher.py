@@ -3,6 +3,8 @@ import os
 import re
 import subprocess
 import time
+import json
+import pickle
 
 import random
 import base64
@@ -98,6 +100,63 @@ class DataFetcher:
         self.LOGIN_EXPECTED_TIME = int(os.getenv("LOGIN_EXPECTED_TIME", 10))
         self.RETRY_WAIT_TIME_OFFSET_UNIT = int(os.getenv("RETRY_WAIT_TIME_OFFSET_UNIT", 10))
         self.IGNORE_USER_ID = os.getenv("IGNORE_USER_ID", "xxxxx,xxxxx").split(",")
+
+    COOKIE_FILE = "/data/cookies.pkl"
+
+    def _save_cookies(self, driver):
+        """登录成功后保存 cookie 到文件"""
+        try:
+            cookies = driver.get_cookies()
+            with open(self.COOKIE_FILE, "wb") as f:
+                pickle.dump(cookies, f)
+            logging.info(f"Cookies saved to {self.COOKIE_FILE}, {len(cookies)} cookies.")
+        except Exception as e:
+            logging.warning(f"Failed to save cookies: {e}")
+
+    def _load_cookies(self, driver):
+        """加载保存的 cookie 到浏览器"""
+        if not os.path.exists(self.COOKIE_FILE):
+            logging.info("No saved cookies found.")
+            return False
+        try:
+            with open(self.COOKIE_FILE, "rb") as f:
+                cookies = pickle.load(f)
+            # 先打开国网域名，才能设置该域名的 cookie
+            driver.get("https://95598.cn")
+            time.sleep(3)
+            for cookie in cookies:
+                # 移除可能导致问题的字段
+                cookie.pop("sameSite", None)
+                cookie.pop("expiry", None)
+                try:
+                    driver.add_cookie(cookie)
+                except Exception:
+                    pass
+            logging.info(f"Loaded {len(cookies)} cookies from {self.COOKIE_FILE}.")
+            return True
+        except Exception as e:
+            logging.warning(f"Failed to load cookies: {e}")
+            return False
+
+    def _is_logged_in(self, driver):
+        """通过访问数据页面判断 cookie 是否仍有效"""
+        try:
+            driver.get(BALANCE_URL)
+            time.sleep(self.RETRY_WAIT_TIME_OFFSET_UNIT)
+            # 如果跳转到了登录页，说明 cookie 已过期
+            current_url = driver.current_url
+            if "login" in current_url:
+                logging.info("Cookie expired, redirected to login page.")
+                return False
+            # 尝试找到用户信息元素，确认确实登录了
+            WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located((By.CLASS_NAME, "el-input__suffix"))
+            )
+            logging.info("Cookie still valid, skipping login!")
+            return True
+        except Exception:
+            logging.info("Cookie validation failed, need to login.")
+            return False
 
     # @staticmethod
     def _click_button(self, driver, button_search_type, button_search_key):
@@ -342,30 +401,40 @@ class DataFetcher:
 
         driver = self._get_webdriver()
         ErrorWatcher.instance().set_driver(driver)
-        
-        driver.maximize_window() 
+
+        driver.maximize_window()
         time.sleep(self.RETRY_WAIT_TIME_OFFSET_UNIT)
         logging.info("Webdriver initialized.")
         updator = SensorUpdator()
-        
-        try:
-            if os.getenv("DEBUG_MODE", "false").lower() == "true":
-                if self._login(driver,phone_code=True):
-                    logging.info("login successed !")
+
+        # 先尝试用保存的 cookie 恢复登录态
+        logged_in = False
+        if self._load_cookies(driver):
+            if self._is_logged_in(driver):
+                logged_in = True
+
+        # cookie 无效，走正常登录流程
+        if not logged_in:
+            try:
+                if os.getenv("DEBUG_MODE", "false").lower() == "true":
+                    if self._login(driver, phone_code=True):
+                        logging.info("login successed !")
+                    else:
+                        logging.info("login unsuccessed !")
+                        raise Exception("login unsuccessed")
                 else:
-                    logging.info("login unsuccessed !")
-                    raise Exception("login unsuccessed")
-            else:
-                if self._login(driver):
-                    logging.info("login successed !")
-                else:
-                    logging.info("login unsuccessed !")
-                    raise Exception("login unsuccessed")
-        except Exception as e:
-            logging.error(
-                f"Webdriver quit abnormly, reason: {e}. {self.RETRY_TIMES_LIMIT} retry times left.")
-            driver.quit()
-            return
+                    if self._login(driver):
+                        logging.info("login successed !")
+                    else:
+                        logging.info("login unsuccessed !")
+                        raise Exception("login unsuccessed")
+                # 登录成功，保存 cookie 供下次复用
+                self._save_cookies(driver)
+            except Exception as e:
+                logging.error(
+                    f"Webdriver quit abnormly, reason: {e}. {self.RETRY_TIMES_LIMIT} retry times left.")
+                driver.quit()
+                return
 
         logging.info(f"Login successfully on {LOGIN_URL}")
         time.sleep(self.RETRY_WAIT_TIME_OFFSET_UNIT)
